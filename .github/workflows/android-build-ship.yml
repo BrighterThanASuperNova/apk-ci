@@ -1,0 +1,416 @@
+name: android-build-ship
+
+# Reusable build/sign/test/ship pipeline. Called by each app repo's build.yml.
+#
+# The github context inside a workflow_call resolves to the CALLING repo, so
+# github.run_number, github.repository and github.ref all belong to the app repo.
+# That is what makes a per-app monotonic versionCode work.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'appblocker | facebookguard | bugcatcher'
+        type: string
+        required: true
+      channel:
+        description: 'stable (from main) | preview (every other branch)'
+        type: string
+        required: true
+      drops-repo:
+        type: string
+        default: 'BrighterThanASuperNova/apk-drops'
+      run-emulator-tests:
+        type: boolean
+        default: true
+      emulator-api-level:
+        type: number
+        default: 30
+      version-code-offset:
+        description: 'Bump past the highest published versionCode if run_number ever resets'
+        type: number
+        default: 1000
+      publish:
+        type: boolean
+        default: true
+    secrets:
+      ANDROID_KEYSTORE_BASE64:   { required: true }
+      ANDROID_KEYSTORE_PASSWORD: { required: true }
+      ANDROID_KEY_ALIAS:         { required: true }
+      ANDROID_KEY_PASSWORD:      { required: true }
+      DROPS_REPO_TOKEN:          { required: true }
+      # OPENROUTER_API_KEY is deliberately NOT accepted here. The build job runs
+      # agent-authored Gradle scripts and tests; handing it the agent's own
+      # credential would let that code exfiltrate it.
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Proves the reusable-workflow context belongs to the caller. Cheap, and it
+      # is the assumption the whole versionCode scheme rests on.
+      - name: Context check
+        run: |
+          echo "repo=$GITHUB_REPOSITORY run_number=$GITHUB_RUN_NUMBER attempt=$GITHUB_RUN_ATTEMPT"
+          echo "ref=$GITHUB_REF_NAME sha=${GITHUB_SHA:0:8}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          # No cache here - setup-gradle owns Gradle caching.
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          # Only main writes the shared cache, so an agent branch cannot poison it.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+          add-job-summary: on-failure
+
+      # gradlew is committed mode 100644 in these repos, so without this the very
+      # first Gradle call dies with "Permission denied".
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Compute version and variant
+        env:
+          APP: ${{ inputs.app-name }}
+          CH: ${{ inputs.channel }}
+          OFFSET: ${{ inputs.version-code-offset }}
+        run: |
+          set -euo pipefail
+          case "$CH" in
+            stable)  VARIANT=release; VARIANT_CAP=Release; SUFFIX="" ;;
+            preview) VARIANT=preview; VARIANT_CAP=Preview; SUFFIX=".preview" ;;
+            *) echo "::error::unknown channel '$CH' (expected stable|preview)"; exit 1 ;;
+          esac
+
+          CODE=$(( OFFSET + GITHUB_RUN_NUMBER ))
+          REF="${{ github.head_ref || github.ref_name }}"
+          SLUG=$(printf '%s' "$REF" | tr -c 'A-Za-z0-9' '-' | cut -c1-20)
+          if [ "$CH" = "stable" ]; then NAME="1.0.$CODE"; else NAME="1.0.$CODE-$SLUG"; fi
+
+          {
+            echo "VARIANT=$VARIANT"
+            echo "VARIANT_CAP=$VARIANT_CAP"
+            echo "APP_VERSION_CODE=$CODE"
+            echo "APP_VERSION_NAME=$NAME"
+            echo "APP_ID=com.example.${APP}${SUFFIX}"
+            echo "APK_PATH=app/build/outputs/apk/${VARIANT}/app-${VARIANT}.apk"
+            echo "BRANCH=$REF"
+          } >> "$GITHUB_ENV"
+
+          echo "Building $APP $CH -> versionCode=$CODE versionName=$NAME"
+
+      - name: Materialise signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STOREPASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # $RUNNER_TEMP, never the workspace: nothing here can be swept up by an
+          # upload-artifact glob or an agent's `git add -A`.
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/apk-ci.jks"
+          test -s "$RUNNER_TEMP/apk-ci.jks" || { echo "::error::keystore decoded empty"; exit 1; }
+          # This assertion is what stops a broken secret falling through to a
+          # debug-keystore signed release, which would be unfixable on-device.
+          keytool -list -keystore "$RUNNER_TEMP/apk-ci.jks" -storepass "$STOREPASS" >/dev/null \
+            || { echo "::error::keystore unreadable - wrong password or corrupt base64"; exit 1; }
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/apk-ci.jks" >> "$GITHUB_ENV"
+
+      - name: Fetch apk-ci canonical sources
+        run: |
+          set -euo pipefail
+          # apk-ci is public, so no token needed.
+          git clone --depth 1 https://github.com/BrighterThanASuperNova/apk-ci "$RUNNER_TEMP/apk-ci"
+
+      # Guard 1: the agent must not rewrite the pipeline that constrains it.
+      # Only enforced on agent branches so humans can still edit workflows.
+      - name: Guard - workflow files unchanged on agent branches
+        if: startsWith(github.head_ref || github.ref_name, 'opencode/')
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin main
+          if ! git diff --quiet FETCH_HEAD -- .github/; then
+            echo "::error::agent branch modified .github/ - refusing to build"
+            git diff --stat FETCH_HEAD -- .github/
+            exit 1
+          fi
+
+      # Guard 2: exact-hash check of the CI-owned build.gradle.kts region.
+      # Skipped (with a warning) until the canonical hash is committed, so the
+      # pipeline can be bootstrapped before it is locked down.
+      - name: Guard - CI-owned Gradle region unmodified
+        env:
+          APP: ${{ inputs.app-name }}
+        run: |
+          set -euo pipefail
+          CANON="$RUNNER_TEMP/apk-ci/canonical/${APP}-gradle-region.sha256"
+          if [ ! -f "$CANON" ]; then
+            echo "::warning::no canonical hash for $APP yet - guard not enforced"
+            exit 0
+          fi
+          awk '/CI-OWNED-BEGIN/,/CI-OWNED-END/' app/build.gradle.kts \
+            | sha256sum | cut -d' ' -f1 > "$RUNNER_TEMP/region.sha256"
+          if ! diff -q "$RUNNER_TEMP/region.sha256" "$CANON" >/dev/null; then
+            echo "::error file=app/build.gradle.kts::CI-owned region was modified (signing/version/build-type wiring)"
+            echo "expected $(cat "$CANON")"
+            echo "actual   $(cat "$RUNNER_TEMP/region.sha256")"
+            exit 1
+          fi
+
+      # Guard 3: the vendored updater must match apk-ci byte for byte, ignoring
+      # line 1 (the per-app `package` declaration).
+      - name: Guard - vendored updater has not drifted
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          CANON_DIR="$RUNNER_TEMP/apk-ci/shared/android"
+          [ -d "$CANON_DIR" ] || { echo "::warning::no shared/android in apk-ci yet"; exit 0; }
+          FOUND=0
+          for src in "$CANON_DIR"/*.kt; do
+            base=$(basename "$src")
+            mapfile -t hits < <(find app/src/main/java -name "$base" -type f)
+            [ ${#hits[@]} -eq 0 ] && continue
+            FOUND=1
+            for v in "${hits[@]}"; do
+              if ! diff -u <(tail -n +2 "$src") <(tail -n +2 "$v") >/dev/null; then
+                echo "::error file=$v::vendored copy has drifted from apk-ci canonical"
+                diff -u <(tail -n +2 "$src") <(tail -n +2 "$v") | head -40
+                exit 1
+              fi
+            done
+          done
+          # Not `[ ... ] && echo`: under `set -e` a false test aborts the step.
+          if [ "$FOUND" = "0" ]; then
+            echo "updater not vendored into this app yet - skipping"
+          fi
+
+      - name: Lint
+        run: ./gradlew --no-daemon ":app:lint${VARIANT_CAP}"
+
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon ":app:test${VARIANT_CAP}UnitTest"
+          # Without this the gate silently rots into nothing the day a test file
+          # is deleted: the task still "passes" with zero tests.
+          find app/build/test-results -name 'TEST-*.xml' | grep -q . \
+            || { echo "::error::unit test task produced no results - gate is a no-op"; exit 1; }
+
+      - name: Assemble ${{ inputs.channel }}
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon ":app:assemble${VARIANT_CAP}"
+          test -f "$APK_PATH" || { echo "::error::expected APK missing at $APK_PATH"; exit 1; }
+
+      # Catches a mis-wired build type before it ever reaches a phone: a preview
+      # build that kept the stable applicationId would overwrite the real app.
+      - name: Verify applicationId and signature
+        run: |
+          set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          ACTUAL=$("$BT/aapt2" dump packagename "$APK_PATH")
+          echo "applicationId: $ACTUAL (expected $APP_ID)"
+          [ "$ACTUAL" = "$APP_ID" ] || { echo "::error::applicationId mismatch"; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK_PATH" | grep -i 'SHA-256 digest' || true
+
+      # Tier 1 always instruments `preview`: unminified, so a failure gives a real
+      # stack trace instead of an R8-mangled one.
+      # Tier 2 launches the exact artifact being shipped - the only check that
+      # validates R8 output on stable builds.
+      - name: Enable KVM
+        if: ${{ inputs.run-emulator-tests }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Cache AVD snapshot
+        if: ${{ inputs.run-emulator-tests }}
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ inputs.emulator-api-level }}-default-x86_64-v1
+
+      - name: Create AVD snapshot
+        if: ${{ inputs.run-emulator-tests && steps.avd-cache.outputs.cache-hit != 'true' }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.emulator-api-level }}
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot."
+
+      - name: Emulator checks
+        if: ${{ inputs.run-emulator-tests }}
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        with:
+          api-level: ${{ inputs.emulator-api-level }}
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -euo pipefail
+
+            echo "::group::Tier 1 - instrumented smoke test (preview variant)"
+            ./gradlew --no-daemon -PtestBuildType=preview ":app:connectedPreviewAndroidTest"
+            echo "::endgroup::"
+
+            echo "::group::Tier 2 - launch the exact shipped artifact"
+            adb uninstall "$APP_ID" >/dev/null 2>&1 || true
+            adb install -r -t "$APK_PATH"
+            adb logcat -c
+            # `monkey -p` avoids the applicationIdSuffix trap: the package is
+            # com.example.appblocker.preview but the activity class is still
+            # com.example.appblocker.MainActivity, so `am start -n` needs a
+            # counterintuitive component name. monkey sidesteps it entirely.
+            adb shell monkey -p "$APP_ID" -c android.intent.category.LAUNCHER 1
+            sleep 6
+            adb shell pidof "$APP_ID" >/dev/null \
+              || { echo "::error::process died after launch"; adb logcat -d | tail -120; exit 1; }
+            adb logcat -d > logcat.txt
+            if grep -q "FATAL EXCEPTION" logcat.txt; then
+              echo "::error::FATAL EXCEPTION after launch"
+              grep -A40 "FATAL EXCEPTION" logcat.txt | head -60
+              exit 1
+            fi
+            echo "launched clean: $APP_ID"
+            echo "::endgroup::"
+
+      - name: Build release manifest JSON
+        id: manifest
+        env:
+          APP: ${{ inputs.app-name }}
+          CH: ${{ inputs.channel }}
+          DROPS: ${{ inputs.drops-repo }}
+          # Via env, never interpolated into the script body: a commit message
+          # containing quotes or $(...) would otherwise execute on the runner.
+          RELEASE_NOTES: ${{ github.event.head_commit.message || 'Manual build' }}
+        run: |
+          set -euo pipefail
+          SHA=$(sha256sum "$APK_PATH" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$APK_PATH")
+          TAG="${APP}-${CH}"
+          OUT="$RUNNER_TEMP/${TAG}.json"
+          cp "$APK_PATH" "$RUNNER_TEMP/${TAG}.apk"
+
+          jq -n \
+            --argjson schema 1 \
+            --arg app "$APP" --arg channel "$CH" --arg applicationId "$APP_ID" \
+            --argjson versionCode "$APP_VERSION_CODE" --arg versionName "$APP_VERSION_NAME" \
+            --arg apkUrl "https://github.com/${DROPS}/releases/download/${TAG}/${TAG}.apk" \
+            --argjson sizeBytes "$SIZE" --arg sha256 "$SHA" \
+            --argjson minSdk 26 \
+            --arg branch "$BRANCH" --arg commit "${GITHUB_SHA:0:8}" \
+            --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg releaseNotes "$RELEASE_NOTES" \
+            '{schema:$schema,app:$app,channel:$channel,applicationId:$applicationId,
+              versionCode:$versionCode,versionName:$versionName,apkUrl:$apkUrl,
+              sizeBytes:$sizeBytes,sha256:$sha256,minSdk:$minSdk,branch:$branch,
+              commit:$commit,publishedAt:$publishedAt,releaseNotes:$releaseNotes}' > "$OUT"
+
+          cat "$OUT"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "JSON_PATH=$OUT" >> "$GITHUB_ENV"
+          echo "STAGED_APK=$RUNNER_TEMP/${TAG}.apk" >> "$GITHUB_ENV"
+
+      # Always upload, so a publish:false PR still has a downloadable build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-${{ inputs.channel }}-${{ github.run_number }}
+          path: |
+            ${{ env.STAGED_APK }}
+            ${{ env.JSON_PATH }}
+          if-no-files-found: error
+
+      - name: Publish to drops repo
+        if: ${{ inputs.publish && success() }}
+        env:
+          GH_TOKEN: ${{ secrets.DROPS_REPO_TOKEN }}
+          DROPS: ${{ inputs.drops-repo }}
+        run: |
+          set -euo pipefail
+
+          # Monotonic guard. github.run_number is scoped per workflow FILE, so
+          # renaming build.yml resets it to 1 - which would silently kill updates
+          # forever. Fail loudly instead.
+          PREV=0
+          if curl -fsSL -o "$RUNNER_TEMP/prev.json" \
+               "https://github.com/${DROPS}/releases/download/${TAG}/${TAG}.json"; then
+            PREV=$(jq -r '.versionCode // 0' "$RUNNER_TEMP/prev.json")
+          fi
+          case "$PREV" in ''|*[!0-9]*) PREV=0 ;; esac
+          echo "previous versionCode=$PREV, this build=$APP_VERSION_CODE"
+
+          if [ "$APP_VERSION_CODE" -lt "$PREV" ]; then
+            echo "::error::versionCode regression ($APP_VERSION_CODE < $PREV). Bump version-code-offset past $PREV."
+            exit 1
+          fi
+          if [ "$APP_VERSION_CODE" -eq "$PREV" ]; then
+            # Re-running a run keeps run_number and only bumps run_attempt, so
+            # this is the same build. Republishing changes nothing.
+            echo "::notice::versionCode $APP_VERSION_CODE already published - idempotent re-run, skipping"
+            exit 0
+          fi
+
+          # Immutable per-build release first - this is the rollback source.
+          gh release create "${TAG}-v${APP_VERSION_CODE}" --repo "$DROPS" \
+            --title "${TAG} v${APP_VERSION_CODE}" \
+            --notes "branch \`${BRANCH}\` commit \`${GITHUB_SHA:0:8}\`" \
+            "$STAGED_APK" "$JSON_PATH"
+
+          # Then the moving pointer. APK BEFORE JSON: the JSON is the commit point,
+          # so it must never name an APK that is not already in place.
+          gh release create "$TAG" --repo "$DROPS" \
+            --title "$TAG (latest)" --notes "Moving pointer for the ${TAG} stream." \
+            2>/dev/null || true
+          gh release upload "$TAG" "$STAGED_APK" --repo "$DROPS" --clobber
+          gh release upload "$TAG" "$JSON_PATH"  --repo "$DROPS" --clobber
+
+          echo "published https://github.com/${DROPS}/releases/download/${TAG}/${TAG}.json"
+
+      # This is what the agent reads to self-heal - a first-class output.
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-diagnostics-${{ github.run_number }}
+          path: |
+            app/build/reports/
+            app/build/outputs/androidTest-results/
+            app/build/test-results/
+            logcat.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/apk-ci.jks"
