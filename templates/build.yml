@@ -1,0 +1,73 @@
+# Copy to <app>/.github/workflows/build.yml and set app-name.
+#
+# EXACTLY ONE caller workflow file per app repo. github.run_number is scoped per
+# workflow FILE, so a second file would produce a second counter and colliding
+# versionCodes. If you need another entry point, add it to this file's
+# workflow_dispatch instead of creating a new file.
+
+name: build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        options: [preview, stable]
+        default: preview
+      ref:
+        description: 'Ref to build - used for roll-forward rollback from a phone'
+        type: string
+        required: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  # Never cancel on main: a cancelled publish can leave a half-uploaded pointer.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # head_commit only exists on push and labels only on pull_request, so the
+  # decision has to happen in the caller where both contexts are available.
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      emulator: ${{ steps.d.outputs.emulator }}
+    steps:
+      - id: d
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+          TITLE: ${{ github.event.pull_request.title }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Default: emulator on PRs and on main only. Plain agent-branch pushes
+          # get lint + unit + assemble, which halves minutes with little lost signal.
+          RUN=false
+          if [ "$EVENT" = "pull_request" ] || [ "$REF" = "refs/heads/main" ]; then RUN=true; fi
+
+          case "$MSG$TITLE$LABELS" in *skip-emulator*) RUN=false ;; esac
+
+          # The asymmetry IS the safety property: [skip-emulator] works on
+          # preview and is silently ignored on stable.
+          if [ "$REF" = "refs/heads/main" ]; then RUN=true; fi
+
+          echo "emulator=$RUN" >> "$GITHUB_OUTPUT"
+          echo "emulator tests: $RUN"
+
+  ci:
+    needs: decide
+    uses: BrighterThanASuperNova/apk-ci/.github/workflows/android-build-ship.yml@main
+    with:
+      app-name: APP_NAME_HERE
+      channel: ${{ (github.event_name == 'workflow_dispatch' && inputs.channel) || (github.ref == 'refs/heads/main' && 'stable') || 'preview' }}
+      run-emulator-tests: ${{ needs.decide.outputs.emulator == 'true' }}
+    secrets:
+      ANDROID_KEYSTORE_BASE64:   ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS:         ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD:      ${{ secrets.ANDROID_KEY_PASSWORD }}
+      DROPS_REPO_TOKEN:          ${{ secrets.DROPS_REPO_TOKEN }}

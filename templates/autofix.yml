@@ -1,0 +1,116 @@
+# Copy to <app>/.github/workflows/autofix.yml
+#
+# When a build fails on an agent branch, hand the failure straight back to
+# OpenCode. Enable with:  gh variable set AUTOFIX_ENABLED --body true
+#
+# Design note: this does NOT post a "/oc fix it" comment. Comments authored with
+# GITHUB_TOKEN do not trigger workflow runs, so that design silently does
+# nothing - and "fixing" it with a PAT reopens unbounded looping. Invoking the
+# action directly removes the loop mechanism rather than merely bounding it.
+
+name: autofix
+
+on:
+  workflow_run:
+    workflows: ["build"]
+    types: [completed]
+
+concurrency:
+  group: autofix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false   # two failures must not fan out
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  id-token: write
+
+jobs:
+  autofix:
+    # Every one of these must hold.
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      startsWith(github.event.workflow_run.head_branch, 'opencode/') &&
+      vars.AUTOFIX_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      - name: Check retry budget
+        id: budget
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            echo "no open PR for $BRANCH - not autofixing"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          LABELS=$(gh pr view "$PR" --json labels --jq '[.labels[].name] | join(",")')
+          case "$LABELS" in
+            *autofix-exhausted*|*no-autofix*)
+              echo "PR #$PR is labelled off-limits"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+
+          # Monotonic by construction: each attempt adds exactly one marker.
+          COUNT=$(gh pr view "$PR" --json comments \
+            --jq '[.comments[] | select(.body | startswith("<!-- autofix:"))] | length')
+          echo "attempt count so far: $COUNT"
+          if [ "$COUNT" -ge 3 ]; then
+            gh pr edit "$PR" --add-label autofix-exhausted
+            gh pr comment "$PR" --body "3 failed autofix attempts. Handing back to a human."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          gh pr comment "$PR" --body "<!-- autofix:attempt=$((COUNT+1)) run=$RUN_ID -->
+Build failed on \`$BRANCH\`. Attempt $((COUNT+1)) of 3."
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "attempt=$((COUNT+1))" >> "$GITHUB_OUTPUT"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+
+      - name: Collect failure log
+        if: steps.budget.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          gh run view "$RUN_ID" --log-failed > "$RUNNER_TEMP/failed.log" 2>/dev/null || true
+          # Keep the prompt small: the tail is where the actual error lives.
+          tail -c 12000 "$RUNNER_TEMP/failed.log" > "$RUNNER_TEMP/failed.tail" || true
+          wc -c < "$RUNNER_TEMP/failed.tail" || true
+
+      - name: Hand the failure to OpenCode
+        if: steps.budget.outputs.go == 'true'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: openrouter/anthropic/claude-sonnet-5
+          share: 'false'
+          prompt: |
+            The CI build failed on branch ${{ github.event.workflow_run.head_branch }}
+            (PR #${{ steps.budget.outputs.pr }}, autofix attempt
+            ${{ steps.budget.outputs.attempt }} of 3).
+
+            Failing run: ${{ github.event.workflow_run.html_url }}
+
+            Read AGENTS.md first. Respect every HANDS-OFF rule in it - in
+            particular do not touch versionCode/versionName, the CI-OWNED region
+            of app/build.gradle.kts, .github/workflows/, or the vendored
+            update/*.kt files. CI enforces those and will fail the build again.
+
+            Diagnose the failure from the log tail at $RUNNER_TEMP/failed.tail,
+            fix the underlying cause, and commit to this branch. Do not paper
+            over a failing test by deleting or disabling it. If the correct fix
+            requires touching a HANDS-OFF file, stop and explain why in a PR
+            comment instead of doing it.

