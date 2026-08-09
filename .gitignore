@@ -1,0 +1,14 @@
+# Planning docs stay local — they document the threat model and internal
+# reasoning, and this repo is public.
+PLAN.md
+*.plan.md
+
+# Never, under any circumstances
+*.jks
+*.keystore
+*.p12
+keystore.base64.txt
+local.properties
+
+.DS_Store
+Thumbs.db
