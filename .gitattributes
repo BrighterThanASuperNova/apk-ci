@@ -1,0 +1,16 @@
+# Authored on Windows, executed on ubuntu runners. Without this, Git's autocrlf
+# gives shell scripts CRLF endings and they die with:
+#   /usr/bin/env: 'bash\r': No such file or directory
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.kt   text eol=lf
+*.kts  text eol=lf
+*.md   text eol=lf
+
+*.jks     binary
+*.keystore binary
+*.apk     binary
+*.png     binary
