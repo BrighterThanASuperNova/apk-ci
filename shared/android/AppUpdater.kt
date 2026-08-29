@@ -158,6 +158,10 @@ object AppUpdater {
         download(activity, m)
     }
 
+    // SetTextI18n: this file is vendored verbatim into every app, so it cannot
+    // depend on a per-app string resource. These strings are a developer-facing
+    // update dialog that will never be localised.
+    @Suppress("SetTextI18n")
     private fun download(activity: Activity, m: UpdateManifest) {
         val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = false

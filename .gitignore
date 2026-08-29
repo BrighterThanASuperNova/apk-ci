@@ -12,3 +12,6 @@ local.properties
 
 .DS_Store
 Thumbs.db
+
+# Local Claude Code permission state - machine-specific, not shared config.
+.claude/settings.local.json
