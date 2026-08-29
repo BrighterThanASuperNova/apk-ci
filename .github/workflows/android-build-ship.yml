@@ -262,6 +262,52 @@ jobs:
           disable-animations: false
           script: echo "Generated AVD snapshot."
 
+      # reactivecircus/android-emulator-runner's `script:` input runs each
+      # line of the block as its OWN independent `sh -c` invocation (visible in
+      # a live run as repeated `[command]/usr/bin/sh -c <line>` entries) rather
+      # than as one coherent script. A backslash line-continuation therefore
+      # splits into two calls, and the second - starting with a bare `||` -
+      # is a syntax error with nothing to fall back on the left of it. Writing
+      # the real logic to a file with normal bash (this step) and having the
+      # emulator step invoke that file as a single line sidesteps the whole
+      # class of problem: multi-line if/fi, backslash continuations, pipefail,
+      # all work again because a real bash process parses the file as one unit.
+      - name: Write emulator check script
+        if: ${{ inputs.run-emulator-tests }}
+        run: |
+          cat > "$RUNNER_TEMP/emulator-checks.sh" <<'SCRIPT'
+          set -euo pipefail
+
+          echo "::group::Tier 1 - instrumented smoke test (preview variant)"
+          ./gradlew --no-daemon -PtestBuildType=preview ":app:connectedPreviewAndroidTest"
+          echo "::endgroup::"
+
+          echo "::group::Tier 2 - launch the exact shipped artifact"
+          adb uninstall "$APP_ID" >/dev/null 2>&1 || true
+          adb install -r -t "$APK_PATH"
+          adb logcat -c
+          # `monkey -p` avoids the applicationIdSuffix trap: the package is
+          # com.example.appblocker.preview but the activity class is still
+          # com.example.appblocker.MainActivity, so `am start -n` needs a
+          # counterintuitive component name. monkey sidesteps it entirely.
+          adb shell monkey -p "$APP_ID" -c android.intent.category.LAUNCHER 1
+          sleep 6
+          if ! adb shell pidof "$APP_ID" >/dev/null; then
+            echo "::error::process died after launch"
+            adb logcat -d | tail -120
+            exit 1
+          fi
+          adb logcat -d > logcat.txt
+          if grep -q "FATAL EXCEPTION" logcat.txt; then
+            echo "::error::FATAL EXCEPTION after launch"
+            grep -A40 "FATAL EXCEPTION" logcat.txt | head -60
+            exit 1
+          fi
+          echo "launched clean: $APP_ID"
+          echo "::endgroup::"
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/emulator-checks.sh"
+
       - name: Emulator checks
         if: ${{ inputs.run-emulator-tests }}
         uses: reactivecircus/android-emulator-runner@v2
@@ -277,39 +323,7 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # reactivecircus/android-emulator-runner runs this via plain POSIX
-          # `sh -c`, not bash, unlike every other `run:` step in this workflow.
-          # `pipefail` is a bash/ksh extension - `sh` on ubuntu rejects it
-          # outright with "Illegal option -o pipefail". None of the pipes below
-          # need it (the failing side is always the last command in its pipe),
-          # so plain `set -eu` is both correct and portable here.
-          script: |
-            set -eu
-
-            echo "::group::Tier 1 - instrumented smoke test (preview variant)"
-            ./gradlew --no-daemon -PtestBuildType=preview ":app:connectedPreviewAndroidTest"
-            echo "::endgroup::"
-
-            echo "::group::Tier 2 - launch the exact shipped artifact"
-            adb uninstall "$APP_ID" >/dev/null 2>&1 || true
-            adb install -r -t "$APK_PATH"
-            adb logcat -c
-            # `monkey -p` avoids the applicationIdSuffix trap: the package is
-            # com.example.appblocker.preview but the activity class is still
-            # com.example.appblocker.MainActivity, so `am start -n` needs a
-            # counterintuitive component name. monkey sidesteps it entirely.
-            adb shell monkey -p "$APP_ID" -c android.intent.category.LAUNCHER 1
-            sleep 6
-            adb shell pidof "$APP_ID" >/dev/null \
-              || { echo "::error::process died after launch"; adb logcat -d | tail -120; exit 1; }
-            adb logcat -d > logcat.txt
-            if grep -q "FATAL EXCEPTION" logcat.txt; then
-              echo "::error::FATAL EXCEPTION after launch"
-              grep -A40 "FATAL EXCEPTION" logcat.txt | head -60
-              exit 1
-            fi
-            echo "launched clean: $APP_ID"
-            echo "::endgroup::"
+          script: bash "$RUNNER_TEMP/emulator-checks.sh"
 
       - name: Build release manifest JSON
         id: manifest
