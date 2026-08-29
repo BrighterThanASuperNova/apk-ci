@@ -71,8 +71,7 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
-          gh pr comment "$PR" --body "<!-- autofix:attempt=$((COUNT+1)) run=$RUN_ID -->
-Build failed on \`$BRANCH\`. Attempt $((COUNT+1)) of 3."
+          gh pr comment "$PR" --body "<!-- autofix:attempt=$((COUNT+1)) run=$RUN_ID --> Build failed on \`$BRANCH\`. Attempt $((COUNT+1)) of 3."
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
           echo "attempt=$((COUNT+1))" >> "$GITHUB_OUTPUT"
           echo "go=true" >> "$GITHUB_OUTPUT"
