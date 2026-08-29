@@ -21,7 +21,7 @@ clone it without a token.
 ## Invariants — breaking any of these breaks updates on a real device
 
 1. **One keystore signs debug, preview and release, in all three apps.**
-   Fingerprint `29:D0:2D:19:90:5B:66:F8:...:D4:79:E9:E5`. A different signature
+   Fingerprint `51:C7:9D:35:F1:A4:A6:6E:...:AD:16:DC:55`. A different signature
    means `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, unfixable without an uninstall
    that loses app data.
 
@@ -123,13 +123,18 @@ preview app installed next to the stable one, and the user looking at it.
 
 ## Local verification (Windows)
 
-A full Android toolchain is present, so verify before pushing:
+Toolchain paths are per-machine - check what's actually installed before
+assuming these exist (`Test-Path`, or search for `keytool.exe`/`Sdk`). Do not
+assume a prior session's machine-specific paths still apply.
 
-```
-keytool  C:\Program Files\Android\Android Studio\jbr\bin\keytool.exe
-SDK      C:\Users\count\AppData\Local\Android\Sdk   (platforms 34, 36.1)
-keystore C:\Users\count\.apk-ci-signing\apk-ci-release.jks
-```
+The signing keystore lives at `~/.apk-ci-signing/apk-ci-release.jks` on
+whichever machine last generated it, alongside a
+`CREDENTIALS-MOVE-TO-PASSWORD-MANAGER.txt` with its password and alias (always
+`apkci`). It is never committed - if it is not on the current machine, it must
+be restored from wherever it was backed up (password manager / secure
+storage), not regenerated. Regenerating it produces a new signing identity
+that cannot update any device that already has a build signed with the old
+one.
 
 ```bash
 ./gradlew :app:assemblePreview
