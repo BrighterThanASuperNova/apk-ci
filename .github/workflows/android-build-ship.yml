@@ -277,8 +277,14 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
+          # reactivecircus/android-emulator-runner runs this via plain POSIX
+          # `sh -c`, not bash, unlike every other `run:` step in this workflow.
+          # `pipefail` is a bash/ksh extension - `sh` on ubuntu rejects it
+          # outright with "Illegal option -o pipefail". None of the pipes below
+          # need it (the failing side is always the last command in its pipe),
+          # so plain `set -eu` is both correct and portable here.
           script: |
-            set -euo pipefail
+            set -eu
 
             echo "::group::Tier 1 - instrumented smoke test (preview variant)"
             ./gradlew --no-daemon -PtestBuildType=preview ":app:connectedPreviewAndroidTest"
