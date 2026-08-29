@@ -7,6 +7,13 @@
 # GITHUB_TOKEN do not trigger workflow runs, so that design silently does
 # nothing - and "fixing" it with a PAT reopens unbounded looping. Invoking the
 # action directly removes the loop mechanism rather than merely bounding it.
+#
+# Model cascade: opus -> sonnet -> a free OpenRouter model, same ladder as
+# opencode.yml. Each tier only runs if the previous tier's API call itself
+# errored (rate limit, spend cap, outage) - it cannot detect "produced a wrong
+# fix", so a bad-but-successful completion never falls through. Note this
+# multiplies with the retry-budget cap below: worst case is 3 autofix attempts
+# x 3 model tiers = 9 invocations for one persistently-broken branch.
 
 name: autofix
 
@@ -88,28 +95,66 @@ jobs:
           tail -c 12000 "$RUNNER_TEMP/failed.log" > "$RUNNER_TEMP/failed.tail" || true
           wc -c < "$RUNNER_TEMP/failed.tail" || true
 
-      - name: Hand the failure to OpenCode
+      # Built once so the three cascade steps below don't each carry their own
+      # copy of the same prompt text.
+      - name: Build prompt
+        id: prompt
         if: steps.budget.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          DELIM="PROMPT_$(date +%s%N)"
+          {
+            echo "text<<$DELIM"
+            echo 'The CI build failed on branch ${{ github.event.workflow_run.head_branch }}'
+            echo '(PR #${{ steps.budget.outputs.pr }}, autofix attempt'
+            echo '${{ steps.budget.outputs.attempt }} of 3).'
+            echo ''
+            echo 'Failing run: ${{ github.event.workflow_run.html_url }}'
+            echo ''
+            echo 'Read AGENTS.md first. Respect every HANDS-OFF rule in it - in'
+            echo 'particular do not touch versionCode/versionName, the CI-OWNED region'
+            echo 'of app/build.gradle.kts, .github/workflows/, or the vendored'
+            echo 'update/*.kt files. CI enforces those and will fail the build again.'
+            echo ''
+            echo 'Diagnose the failure from the log tail at $RUNNER_TEMP/failed.tail,'
+            echo 'fix the underlying cause, and commit to this branch. Do not paper'
+            echo 'over a failing test by deleting or disabling it. If the correct fix'
+            echo 'requires touching a HANDS-OFF file, stop and explain why in a PR'
+            echo 'comment instead of doing it.'
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Hand the failure to OpenCode (tier 1 - opus)
+        id: tier1
+        if: steps.budget.outputs.go == 'true'
+        continue-on-error: true
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: openrouter/anthropic/claude-opus-5
+          share: 'false'
+          prompt: ${{ steps.prompt.outputs.text }}
+
+      - name: Hand the failure to OpenCode (tier 2 - sonnet)
+        id: tier2
+        if: steps.budget.outputs.go == 'true' && steps.tier1.outcome == 'failure'
+        continue-on-error: true
         uses: anomalyco/opencode/github@latest
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:
           model: openrouter/anthropic/claude-sonnet-5
           share: 'false'
-          prompt: |
-            The CI build failed on branch ${{ github.event.workflow_run.head_branch }}
-            (PR #${{ steps.budget.outputs.pr }}, autofix attempt
-            ${{ steps.budget.outputs.attempt }} of 3).
+          prompt: ${{ steps.prompt.outputs.text }}
 
-            Failing run: ${{ github.event.workflow_run.html_url }}
-
-            Read AGENTS.md first. Respect every HANDS-OFF rule in it - in
-            particular do not touch versionCode/versionName, the CI-OWNED region
-            of app/build.gradle.kts, .github/workflows/, or the vendored
-            update/*.kt files. CI enforces those and will fail the build again.
-
-            Diagnose the failure from the log tail at $RUNNER_TEMP/failed.tail,
-            fix the underlying cause, and commit to this branch. Do not paper
-            over a failing test by deleting or disabling it. If the correct fix
-            requires touching a HANDS-OFF file, stop and explain why in a PR
-            comment instead of doing it.
+      # Last resort, free tier - see the note at the top of this file.
+      - name: Hand the failure to OpenCode (tier 3 - free)
+        if: steps.budget.outputs.go == 'true' && steps.tier1.outcome == 'failure' && steps.tier2.outcome == 'failure'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: openrouter/z-ai/glm-5.2:free
+          share: 'false'
+          prompt: ${{ steps.prompt.outputs.text }}

