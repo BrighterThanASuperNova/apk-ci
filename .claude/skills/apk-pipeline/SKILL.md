@@ -21,7 +21,7 @@ clone it without a token.
 ## Invariants — breaking any of these breaks updates on a real device
 
 1. **One keystore signs debug, preview and release, in all three apps.**
-   Fingerprint `51:C7:9D:35:F1:A4:A6:6E:...:AD:16:DC:55`. A different signature
+   Fingerprint `29:D0:2D:19:90:5B:66:F8:...:D4:79:E9:E5`. A different signature
    means `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, unfixable without an uninstall
    that loses app data.
 
@@ -127,14 +127,21 @@ Toolchain paths are per-machine - check what's actually installed before
 assuming these exist (`Test-Path`, or search for `keytool.exe`/`Sdk`). Do not
 assume a prior session's machine-specific paths still apply.
 
-The signing keystore lives at `~/.apk-ci-signing/apk-ci-release.jks` on
-whichever machine last generated it, alongside a
-`CREDENTIALS-MOVE-TO-PASSWORD-MANAGER.txt` with its password and alias (always
-`apkci`). It is never committed - if it is not on the current machine, it must
-be restored from wherever it was backed up (password manager / secure
-storage), not regenerated. Regenerating it produces a new signing identity
-that cannot update any device that already has a build signed with the old
-one.
+The signing keystore lives at `~/.apk-ci-signing/apk-ci-release.jks`, alongside
+a password file with its password and alias (always `apkci`). It is never
+committed. **Before doing any signing-related work on a new machine, check
+whether this file already exists there. If it does not, retrieve the exact
+same file from wherever it was backed up (password manager attachment, secure
+transfer) — do not regenerate it.**
+
+Regenerating produces a *different* signing identity. This has already
+happened once: a second keystore was generated on another machine before the
+first one had been transferred, and its secrets (silently corrupted in
+transit) were live on AppBlocker for three days before either problem was
+caught. There is exactly one canonical keystore; its fingerprint is the one
+printed above and in README.md. If you ever find a different fingerprint
+documented, or a secret that fails to decode, treat it as a signal that this
+happened again, not as something to route around.
 
 ```bash
 ./gradlew :app:assemblePreview

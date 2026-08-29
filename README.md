@@ -55,7 +55,7 @@ One keystore signs **debug, preview and release** across all three apps, so buil
 from any source are update-compatible. Fingerprint:
 
 ```
-SHA256: 51:C7:9D:35:F1:A4:A6:6E:49:1D:99:89:43:5A:A7:52:7E:7A:32:BC:CC:75:EA:E2:CB:27:74:D6:AD:16:DC:55
+SHA256: 29:D0:2D:19:90:5B:66:F8:D4:04:57:61:13:4F:24:9D:6A:EE:87:50:B8:AE:A9:0C:FF:DC:BB:90:D4:79:E9:E5
 ```
 
 Verify any APK matches with:
