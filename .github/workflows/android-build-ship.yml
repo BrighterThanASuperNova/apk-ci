@@ -227,6 +227,20 @@ jobs:
           [ "$ACTUAL" = "$APP_ID" ] || { echo "::error::applicationId mismatch"; exit 1; }
           "$BT/apksigner" verify --print-certs "$APK_PATH" | grep -i 'SHA-256 digest' || true
 
+      # The runner image ships ~14 GB free; Gradle caches plus the build use most of
+      # it, and the emulator system image then failed with "No space left on device"
+      # (Clip, 2026-11-15). Drop preinstalled toolchains no Android build uses. Only
+      # this throwaway VM is affected; the Android SDK and ~/.gradle are kept.
+      - name: Free disk space for the emulator
+        if: ${{ inputs.run-emulator-tests }}
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell \
+            /usr/local/julia* /opt/microsoft || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
+
       # Tier 1 always instruments `preview`: unminified, so a failure gives a real
       # stack trace instead of an R8-mangled one.
       # Tier 2 launches the exact artifact being shipped - the only check that
